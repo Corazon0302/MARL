@@ -1,1 +1,1 @@
-python test.py -m A2C
+python test.py -m PPO
