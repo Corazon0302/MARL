@@ -100,10 +100,10 @@ class MetricsCallback(BaseCallback):
         return fig
 
 from datetime import datetime
-def train(args):
+def train(args, params, save_model=False):
     # 创建日志目录
     current_time = datetime.now().strftime("%m%d-%H%M")
-    log_dir = f"./logs/{args.method}/{current_time}"
+    log_dir = f"./logs/PPO/{current_time}"
     os.makedirs(log_dir, exist_ok=True)
 
     # 用于训练的环境 - 无渲染，使用Monitor包装
@@ -117,19 +117,20 @@ def train(args):
     else:
         train_env = Monitor(MyWrapper(render_mode=None), log_dir)
 
-    from stable_baselines3 import PPO, A2C, DQN, SAC, TD3, DDPG
-    if args.method == "PPO":
-        model = PPO("MlpPolicy", train_env, verbose=1, device="cpu")
-    elif args.method == "A2C":
-        model = A2C("MlpPolicy", train_env, verbose=1, device="cpu")
-    elif args.method == "DQN":
-        model = DQN("MlpPolicy", train_env, verbose=1, device="cpu")
-    elif args.method == "SAC":
-        model = SAC("MlpPolicy", train_env, verbose=1, device="cpu")
-    elif args.method == "TD3":
-        model = TD3("MlpPolicy", train_env, verbose=1, device="cpu")
-    elif args.method == "DDPG":
-        model = DDPG("MlpPolicy", train_env, verbose=1, device="cpu")
+    from stable_baselines3 import PPO
+    model = PPO(
+        "MlpPolicy", 
+        env=train_env, 
+        n_steps=1024,
+        batch_size=64,
+        n_epochs=params['n_epochs'],
+        learning_rate=params['learning_rate'],
+        gamma=params['gamma'],
+        gae_lambda=0.98,
+        ent_coef=0.01,
+        verbose=0, 
+        device="cpu"
+        )
 
     from stable_baselines3.common.evaluation import evaluate_policy
     
@@ -137,48 +138,43 @@ def train(args):
     metrics_callback = MetricsCallback(check_freq=args.log_freq, verbose=1)
     
     # 训练模型 - 无可视化
-    model.learn(total_timesteps=args.timesteps, progress_bar=True, callback=metrics_callback)
-    
+    model.learn(total_timesteps=params['total_timesteps'], progress_bar=True, callback=metrics_callback)
+
+    if save_model:
+        model.save(os.path.join(log_dir, "ppo_cartpole"))
+        metrics_callback.plot_metrics(PPO, save_path=log_dir)
+
     # 评估模型
-    mean_reward, std_reward = evaluate_policy(model, train_env, n_eval_episodes=20)
+    mean_reward, std_reward = evaluate_policy(model, train_env, n_eval_episodes=50)
     print(f"评估结果 - 平均回报: {mean_reward:.2f} +/- {std_reward:.2f}")
+    return (mean_reward - std_reward)
 
-    # 绘制训练指标图
-    metrics_callback.plot_metrics(args.method, save_path=log_dir)
+def optimal_param(args, trial):
+    params = {
+        'n_epochs': trial.suggest_int('n_epochs', 3, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
+        'gamma': trial.suggest_float('gamma', 0.9, 0.9999),
+        'total_timesteps': trial.suggest_int('total_timesteps', 20000, 80000),
+    }
+    return train(args, params)
+
+def study(args):
+    import optuna
+    from optuna.samplers import TPESampler
+    study = optuna.create_study(sampler=TPESampler(), study_name='PPO-LunarLander-v2', direction="maximize")
+    study.optimize(lambda trial: optimal_param(args, trial), n_trials=10)
     
-    # 保存模型
-    model.save(os.path.join(log_dir, "cartpole_model"))
-
-    # 取消注释这部分代码以启用可视化测试
-    if args.visualize:
-        test_env = MyWrapper(render_mode="human")
-        if args.method == "PPO":
-            model = PPO.load(os.path.join(log_dir, "cartpole_model"), env=test_env)
-        elif args.method == "A2C":
-            model = A2C.load(os.path.join(log_dir, "cartpole_model"), env=test_env)
-        elif args.method == "DQN":
-            model = DQN.load(os.path.join(log_dir, "cartpole_model"), env=test_env)
-        elif args.method == "SAC":
-            model = SAC.load(os.path.join(log_dir, "cartpole_model"), env=test_env)
-        elif args.method == "TD3":
-            model = TD3.load(os.path.join(log_dir, "cartpole_model"), env=test_env)
-        elif args.method == "DDPG":
-            model = DDPG.load(os.path.join(log_dir, "cartpole_model"), env=test_env)
-        
-        obs, _ = test_env.reset()
-        done, truncated = False, False
-        while not done and not truncated:
-            action, _states = model.predict(obs)
-            obs, rewards, done, truncated, info = test_env.step(action)
-        test_env.close()
+    # 打印最佳参数
+    print("最佳参数：", study.best_params)
+    print("最佳值：", study.best_value)
+    return study.best_params
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train a RL agent on CartPole-v1")
-    parser.add_argument("-m", "--method", default="PPO", type=str, help="RL方法 (PPO, A2C, DQN, SAC, TD3, DDPG)")
     parser.add_argument("-f", "--log_freq", type=int, default=1000, help="记录指标的频率（步数）")
     parser.add_argument("--multi_env" , action="store_true", help="使用多个环境进行训练")
     parser.add_argument("-v", "--visualize", action="store_true", help="训练后可视化")
-    parser.add_argument("--timesteps", type=int, default=80000, help="训练的总步数")
     args = parser.parse_args()
-    train(args)
+    # best_params = study(args)
+    train(args,  {'n_epochs': 9, 'learning_rate': 0.001523891976554767, 'gamma': 0.9655161006681183, 'total_timesteps': 52807}, True)
