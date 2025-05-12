@@ -9,13 +9,28 @@ from mpe2 import simple_tag_v3
 import supersuit as ss
 import random
 from collections import deque
-import time
+import imageio
+import datetime
+# 环境变量设置，解决X11问题
+import os
+os.environ['SDL_VIDEODRIVER'] = 'x11'  # 使用X11驱动
+os.environ['DISPLAY'] = ':0'          # 确保正确的显示设置
 
+# 如果仍有问题，尝试使用下面的设置
+# os.environ['QT_X11_NO_MITSHM'] = '1'
 # 设置随机种子
 SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
+plt.rcParams.update(plt.rcParamsDefault)
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK JP']
+plt.rcParams['axes.unicode_minus'] = False
+# 在代码开头添加
+import matplotlib
+matplotlib.use('Agg')  # 将matplotlib设置为非交互式后端
+# 修改字体设置
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Noto Sans CJK JP', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
 
 # 使用CPU还是GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -30,20 +45,22 @@ LR_CRITIC = 0.001        # Critic学习率
 HIDDEN_SIZE = 64         # 隐藏层大小
 NUM_EPISODES = 20000     # 训练回合数
 MAX_STEPS = 25           # 每回合最大步数
-START_TRAINING = 1000    # 开始训练前收集的步数
+START_TRAINING = 200     # 开始训练前收集的步数
 UPDATE_EVERY = 100       # 更新网络的频率
 NOISE = 0.2              # 探索噪声
+SEED = 42
 
 # 创建环境
-def make_env(render_mode=None):
+def make_env(seed = SEED, render_mode=None):
     env = simple_tag_v3.parallel_env(
         num_good=1,              # 1个逃避者
         num_adversaries=3,       # 3个追捕者
         num_obstacles=2,         # 2个障碍物
         max_cycles=MAX_STEPS,    # 最大步数
         continuous_actions=True, # 使用连续动作空间
-        render_mode=render_mode
+        render_mode=render_mode,
     )
+    env.reset(seed=SEED)
     # 对观察空间进行归一化
     env = ss.observation_lambda_v0(env, lambda obs, obs_space, agent: obs / 10.0)
     return env
@@ -114,7 +131,7 @@ class MADDPGAgent:
         self.actor.train()
         
         if add_noise:
-            action += NOISE * np.random.randn(action.shape[0])
+            action += NOISE * np.random.randn(action.shape[1])
         return np.clip(action, 0, 1)
     
     def update(self, experiences, all_agents):
@@ -137,8 +154,6 @@ class MADDPGAgent:
             q_target = rewards[self.agent_id] + GAMMA * q_next * (1 - dones[self.agent_id])
             
         # 更新Critic
-        # Loss(θ_i) = E[(y_i - Q_i(x, a_1, ..., a_N | θ_i))^2]
-        # y_i = r_i + γ * Q'_i(x', a'_1, ..., a'_N | θ'_i) * (1 - done_i) 并且 a'_j = μ'_j(o'_j | φ'_j) 是所有智能体 j 在下一个状态 x' 下由其目标 Actor 网络选择的动作
         q_current = self.critic(all_obs, all_actions)
         critic_loss = F.mse_loss(q_current, q_target)
         
@@ -226,10 +241,21 @@ class ReplayBuffer:
         return len(self.memory)
 
 class MADDPG:
-    def __init__(self, env):
+    def __init__(self, env, train_prey=True):
         self.env = env
         self.agents = env.possible_agents
         self.num_agents = len(self.agents)
+        self.train_prey = train_prey
+        
+        # 区分追捕者和逃避者
+        self.predator_agents = [agent for agent in self.agents if "adversary" in agent]
+        self.prey_agents = [agent for agent in self.agents if "adversary" not in agent]
+        
+        # 确定要训练的智能体
+        if train_prey:
+            self.agents_to_train = self.agents  # 所有智能体都训练
+        else:
+            self.agents_to_train = self.predator_agents  # 只训练追捕者
         
         # 获取观察和动作空间
         obs_size = {}
@@ -247,17 +273,21 @@ class MADDPG:
     def get_actions(self, observations, add_noise=True):
         actions = {}
         for agent_id, agent in self.maddpg_agents.items():
-            actions[agent_id] = agent.act(np.expand_dims(observations[agent_id], 0), add_noise)[0]
+            # 如果是逃避者且不训练，则返回固定动作(不动)
+            if agent_id in self.prey_agents and not self.train_prey:
+                actions[agent_id] = np.ones(env.action_space(agent_id).shape[0], dtype=np.float32) * 0.5
+            else:
+                actions[agent_id] = agent.act(np.expand_dims(observations[agent_id], 0), add_noise)[0]
         return actions
     
     def update(self):
         if len(self.buffer) < BATCH_SIZE:
             return
-        
         experiences = self.buffer.sample()
         
-        for agent_id, agent in self.maddpg_agents.items():
-            agent.update(experiences, self.maddpg_agents)
+        # 只更新需要训练的智能体
+        for agent_id in self.agents_to_train:
+            self.maddpg_agents[agent_id].update(experiences, self.maddpg_agents)
             
     def save(self, path='models'):
         os.makedirs(path, exist_ok=True)
@@ -267,19 +297,47 @@ class MADDPG:
     def load(self, path='models'):
         for agent_id, agent in self.maddpg_agents.items():
             agent.load(path)
+            
+    def load_custom(self, predator_paths, prey_path):
+        """加载自定义的不同模型作为追捕者和逃避者"""
+        predator_agents = [agent for agent in self.agents if "adversary" in agent]
+        prey_agents = [agent for agent in self.agents if "adversary" not in agent]
+        
+        # 加载追捕者模型
+        for i, agent_id in enumerate(predator_agents):
+            if i < len(predator_paths):
+                self.maddpg_agents[agent_id].actor.load_state_dict(torch.load(f'{predator_paths[i]}/actor_{agent_id}.pth'))
+                self.maddpg_agents[agent_id].critic.load_state_dict(torch.load(f'{predator_paths[i]}/critic_{agent_id}.pth'))
+                self.maddpg_agents[agent_id].hard_update(self.maddpg_agents[agent_id].actor_target, self.maddpg_agents[agent_id].actor)
+                self.maddpg_agents[agent_id].hard_update(self.maddpg_agents[agent_id].critic_target, self.maddpg_agents[agent_id].critic)
+                print(f"已加载追捕者 {agent_id} 模型: {predator_paths[i]}")
+        
+        # 加载逃避者模型
+        for agent_id in prey_agents:
+            self.maddpg_agents[agent_id].actor.load_state_dict(torch.load(f'{prey_path}/actor_{agent_id}.pth'))
+            self.maddpg_agents[agent_id].critic.load_state_dict(torch.load(f'{prey_path}/critic_{agent_id}.pth'))
+            self.maddpg_agents[agent_id].hard_update(self.maddpg_agents[agent_id].actor_target, self.maddpg_agents[agent_id].actor)
+            self.maddpg_agents[agent_id].hard_update(self.maddpg_agents[agent_id].critic_target, self.maddpg_agents[agent_id].critic)
+            print(f"已加载逃避者 {agent_id} 模型: {prey_path}")
 
 def train_maddpg(env, maddpg: MADDPG, n_episodes=NUM_EPISODES, max_steps=MAX_STEPS, print_every=100):
     total_scores = []
     avg_scores = []
     predator_agents = [agent for agent in env.possible_agents if "adversary" in agent]
 
+    # 记录训练配置
+    train_config = {
+        "train_prey": maddpg.train_prey,
+        "n_episodes": n_episodes,
+        "seed": SEED
+    }
+
     for episode in range(1, n_episodes+1):
-        observations, _ = env.reset()
+        observations, _ = env.reset(seed=SEED)  # 使用固定种子
         episode_score = 0
         
         for step in range(max_steps):
             actions = maddpg.get_actions(observations, add_noise=True)
-            
             next_observations, rewards, terminations, truncations, _ = env.step(actions)
             
             # 处理完成状态
@@ -306,85 +364,306 @@ def train_maddpg(env, maddpg: MADDPG, n_episodes=NUM_EPISODES, max_steps=MAX_STE
 
         if episode % print_every == 0:
             print(f'Episode {episode}/{n_episodes} | Average Score: {avg_score:.2f}')
-        if episode % 1000 == 0:
-            maddpg.save(f'models_episode_{episode}')
 
-    maddpg.save() 
-    return total_scores, avg_scores
+    # 创建以时间命名的保存目录
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = "predator_only" if not maddpg.train_prey else "full_model"
+    save_dir = f"multi_model/{current_time}_{model_name}"
+    os.makedirs(save_dir, exist_ok=True)
 
-# 评估函数
-def evaluate_maddpg(env, maddpg, n_episodes=10, render=False):
-    scores = []
-    predator_agents = [agent for agent in env.possible_agents if "adversary" in agent]
+    # 保存训练配置
+    with open(f"{save_dir}/train_config.txt", "w") as f:
+        f.write(f"Train Prey: {maddpg.train_prey}\n")
+        f.write(f"Episodes: {n_episodes}\n")
+        f.write(f"Seed: {SEED}\n")
+
+    maddpg.save(save_dir)
+    print(f"模型已保存至: {save_dir}")
     
-    for episode in range(n_episodes):
-        observations, _ = env.reset()
-        episode_score = 0
-        
-        for step in range(MAX_STEPS):
-            if render:
-                env.render()
-                time.sleep(0.1)
-                
-            actions = maddpg.get_actions(observations, add_noise=False)
-            next_observations, rewards, terminations, truncations, _ = env.step(actions)
-            
-            # 处理完成状态
-            dones = {agent: terminations[agent] or truncations[agent] for agent in env.possible_agents}
-            # 更新状态
-            observations = next_observations
-            
-            # 更新得分
-            predator_score = sum(rewards[agent] for agent in predator_agents)
-            episode_score += predator_score
-            
-            # 如果回合结束，跳出循环
-            if any(dones.values()):
-                break
-
-        scores.append(episode_score)
-        print(f'Evaluation Episode {episode+1}: Score = {episode_score:.2f}')
-    avg_score = np.mean(scores)
-    print(f'Evaluation over {n_episodes} episodes: Average Score = {avg_score:.2f}')
-    
-    return avg_score
-
-def plot_scores(scores, avg_scores):
+    # 保存训练曲线
     plt.figure(figsize=(10, 6))
-    plt.plot(np.arange(len(scores)), scores, alpha=0.3, label='Score')
-    plt.plot(np.arange(len(avg_scores)), avg_scores, label='Average Score')
-    plt.ylabel('Score')
-    plt.xlabel('Episode')
-    plt.title('MADDPG Training Progress')
+    plt.plot(total_scores, alpha=0.3, label='单轮得分')
+    plt.plot(avg_scores, label='平均得分', linewidth=2)
+    plt.ylabel('得分')
+    plt.xlabel('回合')
+    plt.title('MADDPG 训练曲线' + (' (仅追捕者)' if not maddpg.train_prey else ''))
     plt.legend()
-    plt.savefig('maddpg_training.png')
-    plt.show()
+    plt.savefig(f'{save_dir}/training_curve.png')
+    
+    return total_scores, avg_scores, save_dir
+
+def evaluate_maddpg(env, maddpg, n_episodes=3, video_fps=10, use_trained_prey=True):
+    """
+    评估MADDPG智能体
+    
+    参数:
+        env: 评估环境
+        maddpg: MADDPG模型
+        n_episodes: 评估回合数
+        video_fps: 视频帧率
+        use_trained_prey: 是否使用训练过的逃避者，False则逃避者保持静止
+    """
+    predator_agents = [agent for agent in env.possible_agents if "adversary" in agent]
+    prey_agents = [agent for agent in env.possible_agents if "adversary" not in agent]
+    
+    # 创建以时间命名的输出目录
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    prey_mode = "trained_prey" if use_trained_prey else "static_prey"
+    output_dir = f"eval_results/{current_time}_{prey_mode}"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    scores = []
+    catch_count = 0
+    catch_steps = []
+    
+    print(f"\n===== 开始评估 MADDPG 智能体 =====")
+    print(f"逃避者模式: {'使用训练模型' if use_trained_prey else '保持静止'}")
+    print(f"结果将保存至: {output_dir}")
+    
+    try:
+        for episode in range(n_episodes):
+            observations, _ = env.reset(seed=SEED)  # 使用固定种子
+            episode_score = 0
+            frames = []
+            
+            print(f"\n评估回合 {episode+1}/{n_episodes}")
+            
+            for step in range(MAX_STEPS):
+                try:
+                    # 渲染并保存画面
+                    frame = env.render()
+                    if frame is not None:
+                        frames.append(frame)
+                except Exception as e:
+                    print(f"渲染警告: {e}")
+                
+                # 执行动作
+                actions = {}
+                for agent_id, agent in maddpg.maddpg_agents.items():
+                    # 如果是逃避者且设置为不使用训练模型，则保持静止
+                    if agent_id in prey_agents and not use_trained_prey:
+                        actions[agent_id] = np.ones(env.action_space(agent_id).shape[0], dtype=np.float32) * 0.5
+                    else:
+                        actions[agent_id] = agent.act(np.expand_dims(observations[agent_id], 0), add_noise=False)[0]
+                
+                next_observations, rewards, terminations, truncations, _ = env.step(actions)
+                print(next_observations)
+                # 处理完成状态
+                dones = {agent: terminations[agent] or truncations[agent] for agent in env.possible_agents}
+                
+                # 更新状态
+                observations = next_observations
+                
+                # 计算回合得分
+                predator_score = sum(rewards[agent] for agent in predator_agents)
+                episode_score += predator_score
+                
+                # 显示实时信息
+                if step % 5 == 0:
+                    print(f"\r步数: {step+1}/{MAX_STEPS} | 当前得分: {episode_score:.2f}", end="", flush=True)
+                
+                # 判断是否追捕成功
+                if any(terminations.values()) and not any(truncations.values()):
+                    catch_count += 1
+                    catch_steps.append(step + 1)
+                    print(f"\n追捕成功! 用时 {step+1} 步")
+                
+                # 检查回合是否结束
+                if any(dones.values()):
+                    break
+            
+            if step == MAX_STEPS - 1:
+                print("\n达到最大步数，追捕未成功")
+            
+            scores.append(episode_score)
+            print(f"\n回合 {episode+1} 得分: {episode_score:.2f}")
+            
+            # 保存视频
+            if frames:
+                video_path = f"{output_dir}/episode_{episode+1}.mp4"
+                try:
+                    imageio.mimsave(video_path, frames, fps=video_fps)
+                    print(f"视频已保存: {video_path}")
+                except Exception as e:
+                    print(f"视频保存错误: {e}")
+    finally:
+        # 确保环境正确关闭
+        try:
+            env.close()
+        except:
+            pass
+    
+    # 计算统计数据
+    avg_score = np.mean(scores)
+    catch_rate = catch_count / n_episodes * 100
+    avg_catch_steps = np.mean(catch_steps) if catch_steps else 0
+    
+    # 输出总结
+    print("\n===== 评估结果汇总 =====")
+    print(f"回合数: {n_episodes}")
+    print(f"平均得分: {avg_score:.2f}")
+    print(f"追捕成功率: {catch_rate:.1f}%")
+    if catch_steps:
+        print(f"平均追捕时间: {avg_catch_steps:.2f} 步")
+    
+    # 保存评估结果图（使用安全的绘图方式）
+    save_evaluation_plot(output_dir, scores, avg_score)
+    
+    return output_dir# 单独的函数用于安全地绘制和保存评估结果图表
+
+def save_evaluation_plot(output_dir, scores, avg_score):
+    try:
+        plt.figure(figsize=(10, 6))
+        plt.bar(range(1, len(scores)+1), scores)
+        plt.axhline(y=avg_score, color='r', linestyle='-', label=f'平均分: {avg_score:.2f}')
+        plt.xlabel('回合')
+        plt.ylabel('得分')
+        plt.title('评估结果')
+        plt.legend()
+        plt.savefig(f'{output_dir}/evaluation_scores.png')
+        plt.close()  # 确保关闭图表
+    except Exception as e:
+        print(f"图表保存错误: {e}")
+
+# 列出可用的模型文件夹
+def list_model_folders():
+    base_dir = "multi_model"
+    if not os.path.exists(base_dir):
+        print(f"错误: {base_dir} 目录不存在，请先训练模型")
+        return []
+    
+    folders = [f for f in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, f))]
+    folders.sort(reverse=True)  # 按时间倒序排列，最新的在前面
+    
+    if not folders:
+        print(f"错误: 在 {base_dir} 目录中未找到模型文件夹")
+        return []
+    
+    print("\n可用的模型文件夹:")
+    for i, folder in enumerate(folders):
+        print(f"{i+1}. {folder}")
+    
+    return folders
 
 if __name__ == "__main__":
-    os.makedirs('models', exist_ok=True)
-    env = make_env()
-    maddpg = MADDPG(env)
+    os.makedirs('multi_model', exist_ok=True)
+    os.makedirs('eval_results', exist_ok=True)
+    
+    env = make_env(seed=SEED)
 
-    train_mode = input("Train (t) or Evaluate (e)? ").lower().startswith('t')
+    print("\n===== MADDPG 多智能体追逃环境 =====")
+    print("1. 训练模式 - 全部智能体 (t)")
+    print("2. 训练模式 - 仅追捕者 (tp)")
+    print("3. 评估模式 - 同一组模型 (e)")
+    print("4. 评估模式 - 自定义组合 (c)")
     
-    if train_mode:
-        print("Starting training...")
-        # n_episodes = int(input("Number of episodes (default 20000): ") or "20000")
-        n_episodes = 20000
-        scores, avg_scores = train_maddpg(env, maddpg, n_episodes=n_episodes)
+    option = input("\n请选择模式 (t/tp/e/c): ").lower().strip()
+    
+    if option.startswith('t'):
+        print("\n===== 训练模式 =====")
+        n_episodes = int(input("训练回合数 (默认5000): ") or "5000")
         
-        plot_scores(scores, avg_scores)
-        print("\nEvaluating trained agents...")
-        eval_env = make_env(render_mode="human")
-        evaluate_maddpg(eval_env, maddpg, n_episodes=3, render=True)
-        eval_env.close()
-    else:
-        print("Loading trained models...")
-        maddpg.load()
-        print("Evaluating trained agents...")
-        eval_env = make_env(render_mode="human")
-        evaluate_maddpg(eval_env, maddpg, n_episodes=5, render=True)
+        # 确定是否训练逃避者
+        train_prey = True
+        if option == "tp":
+            train_prey = False
+            print("仅训练追捕者，逃避者将保持静止")
+        else:
+            print("训练所有智能体")
+        
+        # 创建MADDPG实例，指定是否训练逃避者
+        maddpg = MADDPG(env, train_prey=train_prey)
+        
+        print(f"\n开始训练 {n_episodes} 回合...")
+        scores, avg_scores, save_dir = train_maddpg(env, maddpg, n_episodes=n_episodes)
+        
+        print("\n训练完成! 是否要评估训练好的模型?")
+        evaluate_option = input("是否评估 (y/n): ").lower().strip()
+        
+        if evaluate_option.startswith('y'):
+            eval_env = make_env(render_mode="human", seed=SEED)
+            n_eval_episodes = int(input("评估回合数 (默认3): ") or "3")
+            evaluate_maddpg(eval_env, maddpg, n_episodes=n_eval_episodes)
+            eval_env.close()
+
+    elif option.startswith('e'):
+        print("\n===== 评估模式 - 使用同一组模型 =====")
+        folders = list_model_folders()
+        if not folders:
+            exit(1)
+
+        selected = int(input("\n请选择要评估的模型 (输入序号): ")) - 1
+        if selected < 0 or selected >= len(folders):
+            print("无效的选择!")
+            exit(1)
+        
+        selected_model = f"multi_model/{folders[selected]}"
+        print(f"选择模型: {selected_model}")
+        
+        # 询问是否使用训练过的逃避者
+        use_trained_prey = input("\n是否使用训练过的逃避者? (y/n): ").lower().strip().startswith('y')
+        if use_trained_prey:
+            print("逃避者将使用训练模型")
+        else:
+            print("逃避者将保持静止")
+        
+        # 创建并加载模型
+        eval_env = make_env(render_mode="human", seed=SEED)
+        maddpg = MADDPG(eval_env, train_prey=True)  # 创建完整模型
+        maddpg.load(selected_model)                # 加载模型参数
+        
+        # 评估模型
+        n_eval_episodes = int(input("评估回合数 (默认3): ") or "3")
+        evaluate_maddpg(eval_env, maddpg, n_episodes=n_eval_episodes, use_trained_prey=use_trained_prey)
+    elif option.startswith('c'):
+        print("\n===== 评估模式 - 自定义组合 =====")
+        folders = list_model_folders()
+        if not folders:
+            exit(1)
+
+        print("\n为3个追捕者选择模型 (adversary_0, adversary_1, adversary_2):")
+        predator_models = []
+        for i in range(3):
+            selected = int(input(f"请为追捕者 {i} 选择模型 (输入序号): ")) - 1
+            if selected < 0 or selected >= len(folders):
+                print("无效的选择!")
+                exit(1)
+            predator_models.append(f"multi_model/{folders[selected]}")
+        
+        selected = int(input("\n请为逃避者 (agent_0) 选择模型 (输入序号): ")) - 1
+        if selected < 0 or selected >= len(folders):
+            print("无效的选择!")
+            exit(1)
+        prey_model = f"multi_model/{folders[selected]}"
+        
+        # 询问是否使用训练过的逃避者
+        use_trained_prey = input("\n是否使用训练过的逃避者? (y/n): ").lower().strip().startswith('y')
+        if use_trained_prey:
+            print("逃避者将使用训练模型")
+        else:
+            print("逃避者将保持静止")
+        
+        print("\n你的选择:")
+        print(f"追捕者模型: {predator_models}")
+        print(f"逃避者模型: {prey_model}")
+        print(f"逃避者行为: {'使用训练模型' if use_trained_prey else '保持静止'}")
+        
+        confirm = input("确认? (y/n): ").lower().strip()
+        if not confirm.startswith('y'):
+            print("已取消")
+            exit(0)
+        
+        # 创建并加载模型
+        eval_env = make_env(render_mode="human", seed=SEED)
+        maddpg = MADDPG(eval_env, train_prey=True)  # 创建完整模型
+        maddpg.load_custom(predator_models, prey_model)
+        
+        # 评估模型
+        n_eval_episodes = int(input("评估回合数 (默认3): ") or "3")
+        evaluate_maddpg(eval_env, maddpg, n_episodes=n_eval_episodes, use_trained_prey=use_trained_prey)        
         eval_env.close()
     
-    # 关闭环境
+    else:
+        print("无效的选择!")
     env.close()
+    print("\n程序执行完毕!")
