@@ -1,0 +1,3 @@
+Train Prey: False
+Episodes: 2000
+Seed: 0

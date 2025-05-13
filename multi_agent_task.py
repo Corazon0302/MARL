@@ -19,7 +19,7 @@ os.environ['DISPLAY'] = ':0'          # 确保正确的显示设置
 # 如果仍有问题，尝试使用下面的设置
 # os.environ['QT_X11_NO_MITSHM'] = '1'
 # 设置随机种子
-SEED = 42
+SEED = 0
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
@@ -28,8 +28,7 @@ plt.rcParams['font.sans-serif'] = ['Noto Sans CJK JP']
 plt.rcParams['axes.unicode_minus'] = False
 # 在代码开头添加
 import matplotlib
-matplotlib.use('Agg')  # 将matplotlib设置为非交互式后端
-# 修改字体设置
+matplotlib.use('Agg') 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Noto Sans CJK JP', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
 
 # 使用CPU还是GPU
@@ -44,11 +43,10 @@ LR_ACTOR = 0.0001        # Actor学习率
 LR_CRITIC = 0.001        # Critic学习率
 HIDDEN_SIZE = 64         # 隐藏层大小
 NUM_EPISODES = 20000     # 训练回合数
-MAX_STEPS = 25           # 每回合最大步数
+MAX_STEPS = 200          # 每回合最大步数
 START_TRAINING = 200     # 开始训练前收集的步数
 UPDATE_EVERY = 100       # 更新网络的频率
 NOISE = 0.2              # 探索噪声
-SEED = 42
 
 # 创建环境
 def make_env(seed = SEED, render_mode=None):
@@ -320,17 +318,49 @@ class MADDPG:
             self.maddpg_agents[agent_id].hard_update(self.maddpg_agents[agent_id].critic_target, self.maddpg_agents[agent_id].critic)
             print(f"已加载逃避者 {agent_id} 模型: {prey_path}")
 
+def cal_rewards(rewards, observations, next_observations, actions, predator_agents, train_prey):
+    # predator_score = sum(rewards[agent] for agent in predator_agents) / 3.0
+    agent_origin_positions = {agent: observations[agent][:2] for agent in rewards.keys()}
+    predator_next_positions = {agent: next_observations[agent][:2] for agent in predator_agents}
+    prey_agents = [agent for agent in rewards.keys() if agent not in predator_agents]
+    prey_position = {agent: next_observations[agent][:2] for agent in prey_agents}
+
+    target_rewards = {}
+    for i, agent in enumerate(predator_agents):
+        # reward = predator_score * 0.5 + rewards[agent] * 0.5
+        reward = rewards[agent] * 0.3
+        prev_dis = np.sqrt(np.sum((agent_origin_positions[agent] - prey_position[prey_agents[0]]) ** 2))
+        dis = np.sqrt(np.sum((predator_next_positions[agent] - prey_position[prey_agents[0]]) ** 2))
+        dis_rewards = - dis * 50 # 距离越近奖励越大，因此直接用负数
+        dis_change_rewards = (prev_dis - dis) * 30 # 距离变化奖励，鼓励追捕者靠近逃避者
+
+        cooperation_rewards = 0. # 协作奖励，追捕者之间距离不要太近也不太远
+        for j, pos in enumerate(predator_next_positions.values()):
+            if j != i:
+                cooperation_dis = np.sqrt(np.sum((pos - predator_next_positions[agent]) ** 2))
+                cooperation_rewards += abs(cooperation_dis - 0.05) * 5
+
+        move_rewards = np.sum(np.abs(actions[agent] - 0.5)) * 0.1 # 鼓励移动
+        target_rewards[agent] = reward + dis_rewards + cooperation_rewards + move_rewards + dis_change_rewards
+
+    for agent in prey_agents:
+        if train_prey:
+            reward = rewards[agent] * 0.5
+
+            dis = 0.
+            for predator in predator_agents:
+                dis += np.sqrt(np.sum((predator_next_positions[predator] - prey_position[agent]) ** 2)) / 3
+            dis_rewards = dis * 10
+            move_rewards = np.sum(np.abs(actions[agent] - 0.5)) * 0.1
+            target_rewards[agent] = reward + dis_rewards + move_rewards
+        else:
+            target_rewards[agent] = 0.0
+    return target_rewards
+
 def train_maddpg(env, maddpg: MADDPG, n_episodes=NUM_EPISODES, max_steps=MAX_STEPS, print_every=100):
     total_scores = []
     avg_scores = []
     predator_agents = [agent for agent in env.possible_agents if "adversary" in agent]
-
-    # 记录训练配置
-    train_config = {
-        "train_prey": maddpg.train_prey,
-        "n_episodes": n_episodes,
-        "seed": SEED
-    }
 
     for episode in range(1, n_episodes+1):
         observations, _ = env.reset(seed=SEED)  # 使用固定种子
@@ -339,11 +369,12 @@ def train_maddpg(env, maddpg: MADDPG, n_episodes=NUM_EPISODES, max_steps=MAX_STE
         for step in range(max_steps):
             actions = maddpg.get_actions(observations, add_noise=True)
             next_observations, rewards, terminations, truncations, _ = env.step(actions)
-            
             # 处理完成状态
             dones = {agent: terminations[agent] or truncations[agent] for agent in env.possible_agents}
 
-            maddpg.buffer.add(observations, actions, rewards, next_observations, dones)
+            target_rewards = cal_rewards(rewards, observations, next_observations, actions, predator_agents, maddpg.train_prey)
+
+            maddpg.buffer.add(observations, actions, target_rewards, next_observations, dones)
             
             # 如果缓冲区足够大，则更新网络
             if len(maddpg.buffer) > START_TRAINING and step % UPDATE_EVERY == 0:
@@ -447,7 +478,7 @@ def evaluate_maddpg(env, maddpg, n_episodes=3, video_fps=10, use_trained_prey=Tr
                         actions[agent_id] = agent.act(np.expand_dims(observations[agent_id], 0), add_noise=False)[0]
                 
                 next_observations, rewards, terminations, truncations, _ = env.step(actions)
-                print(next_observations)
+                # print(next_observations)
                 # 处理完成状态
                 dones = {agent: terminations[agent] or truncations[agent] for agent in env.possible_agents}
                 
