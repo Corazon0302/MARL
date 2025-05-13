@@ -1,2 +1,4 @@
 *.zip
 /logs
+/eval_results
+/multi_model
