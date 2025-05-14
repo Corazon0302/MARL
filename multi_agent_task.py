@@ -35,18 +35,18 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Noto Sans CJK JP', 'DejaVu Sans', 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-BUFFER_SIZE = 100000     # 经验回放缓冲区大小
+BUFFER_SIZE = 50000    # 经验回放缓冲区大小
 BATCH_SIZE = 64          # 批次大小
 GAMMA = 0.95             # 折扣因子
-TAU = 0.01               # 目标网络软更新系数
+TAU = 0.005               # 目标网络软更新系数
 LR_ACTOR = 0.0001        # Actor学习率
 LR_CRITIC = 0.001        # Critic学习率
 HIDDEN_SIZE = 64         # 隐藏层大小
 NUM_EPISODES = 20000     # 训练回合数
-MAX_STEPS = 200          # 每回合最大步数
+MAX_STEPS = 100          # 每回合最大步数
 START_TRAINING = 200     # 开始训练前收集的步数
-UPDATE_EVERY = 100       # 更新网络的频率
-NOISE = 0.2              # 探索噪声
+UPDATE_EVERY = 50       # 更新网络的频率
+NOISE = 0.3              # 探索噪声
 
 # 创建环境
 def make_env(seed = SEED, render_mode=None):
@@ -56,6 +56,7 @@ def make_env(seed = SEED, render_mode=None):
         num_obstacles=2,         # 2个障碍物
         max_cycles=MAX_STEPS,    # 最大步数
         continuous_actions=True, # 使用连续动作空间
+        dynamic_rescaling=True,
         render_mode=render_mode,
     )
     env.reset(seed=SEED)
@@ -89,7 +90,7 @@ class Critic(nn.Module):
             nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE),
             nn.ReLU(),
             nn.Linear(HIDDEN_SIZE, 1),
-            nn.ReLU()
+            nn.Tanh()
         )
         
     def forward(self, state, action):
@@ -319,44 +320,135 @@ class MADDPG:
             print(f"已加载逃避者 {agent_id} 模型: {prey_path}")
 
 def cal_rewards(rewards, observations, next_observations, actions, predator_agents, train_prey):
-    # predator_score = sum(rewards[agent] for agent in predator_agents) / 3.0
-    agent_origin_positions = {agent: observations[agent][:2] for agent in rewards.keys()}
-    predator_next_positions = {agent: next_observations[agent][:2] for agent in predator_agents}
+    # 获取位置信息
+    agent_origin_positions = {agent: observations[agent][2:4] for agent in rewards.keys()}
+    agent_velocities = {agent: observations[agent][4:6] for agent in rewards.keys()}  # 获取速度信息
+    predator_next_positions = {agent: next_observations[agent][2:4] for agent in predator_agents}
+    
     prey_agents = [agent for agent in rewards.keys() if agent not in predator_agents]
-    prey_position = {agent: next_observations[agent][:2] for agent in prey_agents}
-
+    prey_position = {agent: next_observations[agent][2:4] for agent in prey_agents}
+    prey_velocity = {agent: next_observations[agent][4:6] for agent in prey_agents}  # 获取猎物速度
+    prey_agent = prey_agents[0]
+    prey_pos = prey_position[prey_agent]
+    prey_vel = prey_velocity[prey_agent]
+    
+    # 计算距离
+    current_distances = {agent: np.sqrt(np.sum((predator_next_positions[agent] - prey_pos)**2)) for agent in predator_agents}
+    prev_distances = {agent: np.sqrt(np.sum((agent_origin_positions[agent] - prey_pos)**2)) for agent in predator_agents}
+    
+    # 计算追捕者相互之间的距离
+    predator_distances = {}
+    for i, agent_i in enumerate(predator_agents):
+        for j, agent_j in enumerate(predator_agents):
+            if i < j:
+                dist = np.sqrt(np.sum((predator_next_positions[agent_i] - predator_next_positions[agent_j])**2))
+                predator_distances[(agent_i, agent_j)] = dist
+    
+    # 计算追捕者到猎物的方向向量
+    directions_to_prey = {agent: (prey_pos - agent_origin_positions[agent]) for agent in predator_agents}
+    normalized_directions = {}
+    for agent, direction in directions_to_prey.items():
+        magnitude = np.sqrt(np.sum(direction**2)) + 1e-10
+        normalized_directions[agent] = direction / magnitude
+    
+    # 预测猎物下一步位置
+    prey_next_predicted = prey_pos + prey_vel * 0.8  # 假设猎物继续按当前速度移动
+    
     target_rewards = {}
-    for i, agent in enumerate(predator_agents):
-        # reward = predator_score * 0.5 + rewards[agent] * 0.5
-        reward = rewards[agent] * 0.3
-        prev_dis = np.sqrt(np.sum((agent_origin_positions[agent] - prey_position[prey_agents[0]]) ** 2))
-        dis = np.sqrt(np.sum((predator_next_positions[agent] - prey_position[prey_agents[0]]) ** 2))
-        dis_rewards = - dis * 50 # 距离越近奖励越大，因此直接用负数
-        dis_change_rewards = (prev_dis - dis) * 30 # 距离变化奖励，鼓励追捕者靠近逃避者
-
-        cooperation_rewards = 0. # 协作奖励，追捕者之间距离不要太近也不太远
-        for j, pos in enumerate(predator_next_positions.values()):
-            if j != i:
-                cooperation_dis = np.sqrt(np.sum((pos - predator_next_positions[agent]) ** 2))
-                cooperation_rewards += abs(cooperation_dis - 0.05) * 5
-
-        move_rewards = np.sum(np.abs(actions[agent] - 0.5)) * 0.1 # 鼓励移动
-        target_rewards[agent] = reward + dis_rewards + cooperation_rewards + move_rewards + dis_change_rewards
-
+    
+    for agent in predator_agents:
+        env_reward = rewards[agent] * 0.2
+        
+        dis = current_distances[agent]
+        # 接近时奖励迅速增加
+        dis_reward = 15 * np.exp(-2 * dis) - 2
+        
+        # 距离变化奖励
+        dis_change = prev_distances[agent] - current_distances[agent]
+        dis_change_reward = dis_change * 50  # 增大系数，强化接近行为
+        
+        # 大幅增强向猎物方向移动的奖励
+        action_vec = predator_next_positions[agent] - agent_origin_positions[agent]
+        action_mag = np.sqrt(np.sum(action_vec**2) + 1e-10)
+        
+        # 计算行动方向与理想方向的一致性
+        if action_mag > 1e-6:
+            # 朝向当前猎物位置的奖励
+            current_alignment = np.sum(action_vec * normalized_directions[agent]) / action_mag
+            
+            # 朝向预测的猎物位置的奖励
+            pred_direction = prey_next_predicted - agent_origin_positions[agent]
+            pred_direction_norm = pred_direction / (np.sqrt(np.sum(pred_direction**2)) + 1e-10)
+            prediction_alignment = np.sum(action_vec * pred_direction_norm) / action_mag
+            
+            # 综合当前位置和预测位置的移动奖励
+            movement_reward = (current_alignment * 0.7 + prediction_alignment * 0.3) * 12 * min(action_mag, 1.0)
+        else:
+            # 不移动的惩罚
+            movement_reward = -5.0
+        
+        # 协作奖励
+        collaboration_reward = 0
+        optimal_distance = 0.4
+        
+        for other_agent in predator_agents:
+            if agent != other_agent:
+                pair = tuple(sorted([agent, other_agent]))
+                if pair in predator_distances:
+                    dist = predator_distances[pair]
+                    # 使用高斯函数形式，确保在最佳距离处获得最高奖励
+                    collaboration_reward += 4 * np.exp(-6 * (dist - optimal_distance)**2)
+        
+        # 围捕策略奖励
+        # 计算追捕者与猎物之间形成的角度分布
+        angles = []
+        for other_agent in predator_agents:
+            if other_agent != agent:
+                vec1 = normalized_directions[agent]
+                vec2 = normalized_directions[other_agent]
+                cos_angle = np.sum(vec1 * vec2)
+                angle = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+                angles.append(angle)
+        
+        # 理想情况：追捕者均匀分布在猎物周围
+        if len(angles) >= 2:
+            ideal_angle = np.pi * 2 / 3
+            angle_diff = np.abs(np.mean(angles) - ideal_angle)
+            encirclement_reward = 5 * np.exp(-3 * angle_diff)
+        else:
+            encirclement_reward = 0
+        
+        total_reward = env_reward + dis_reward + dis_change_reward + movement_reward + collaboration_reward + encirclement_reward
+        
+        # print(f"Agent {agent}: env={env_reward:.2f}, dis={dis_reward:.2f}, change={dis_change_reward:.2f}, " 
+        #       f"move={movement_reward:.2f}, collab={collaboration_reward:.2f}, encircle={encirclement_reward:.2f}, "
+        #       f"total={total_reward:.2f}")
+        
+        target_rewards[agent] = total_reward
+    
+    # 逃避者奖励计算
     for agent in prey_agents:
         if train_prey:
-            reward = rewards[agent] * 0.5
-
-            dis = 0.
-            for predator in predator_agents:
-                dis += np.sqrt(np.sum((predator_next_positions[predator] - prey_position[agent]) ** 2)) / 3
-            dis_rewards = dis * 10
-            move_rewards = np.sum(np.abs(actions[agent] - 0.5)) * 0.1
-            target_rewards[agent] = reward + dis_rewards + move_rewards
+            base_reward = rewards[agent] * 0.5
+            
+            avg_distance = sum(current_distances.values()) / len(current_distances)
+            distance_reward = avg_distance * 8
+            
+            move_mag = np.sqrt(np.sum(prey_vel**2))
+            movement_reward = min(move_mag * 5, 10)
+            
+            # 逃跑方向奖励
+            nearest_predator = min(current_distances, key=current_distances.get)
+            escape_direction = prey_pos - predator_next_positions[nearest_predator]
+            escape_dir_norm = escape_direction / (np.sqrt(np.sum(escape_direction**2)) + 1e-10)
+            escape_alignment = np.sum(prey_vel * escape_dir_norm) / (move_mag + 1e-10) if move_mag > 1e-6 else 0
+            escape_reward = escape_alignment * 10
+            
+            target_rewards[agent] = base_reward + distance_reward + movement_reward + escape_reward
         else:
             target_rewards[agent] = 0.0
+            
     return target_rewards
-
 def train_maddpg(env, maddpg: MADDPG, n_episodes=NUM_EPISODES, max_steps=MAX_STEPS, print_every=100):
     total_scores = []
     avg_scores = []
@@ -373,7 +465,8 @@ def train_maddpg(env, maddpg: MADDPG, n_episodes=NUM_EPISODES, max_steps=MAX_STE
             dones = {agent: terminations[agent] or truncations[agent] for agent in env.possible_agents}
 
             target_rewards = cal_rewards(rewards, observations, next_observations, actions, predator_agents, maddpg.train_prey)
-
+            # print(target_rewards)
+            
             maddpg.buffer.add(observations, actions, target_rewards, next_observations, dones)
             
             # 如果缓冲区足够大，则更新网络
