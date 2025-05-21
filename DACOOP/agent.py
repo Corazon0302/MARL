@@ -176,138 +176,131 @@ class DACOOPAgent:
         return force_action
     
     def update(self, experiences, other_agents):
+        def process_batch_observation(states_batch, target = False):
+            evader_info = states_batch[:, 12:14]
+            agent_positions = states_batch[:, 2:4]
+            agent_velocities = states_batch[:, 0:2]
+            
+            # 被捕者距离以及方位角
+            evader_distances = torch.norm(evader_info, dim=1, keepdim=True)
+            evader_angles = torch.rad2deg(torch.atan2(evader_info[:, 1], evader_info[:, 0]))
+            
+            # 障碍物距离以及方位角
+            obstacle1_info = states_batch[:, 4:6]
+            obstacle2_info = states_batch[:, 6:8]
+            
+            obstacle1_distances = torch.norm(obstacle1_info, dim=1, keepdim=True)
+            obstacle1_angles = torch.rad2deg(torch.atan2(obstacle1_info[:, 1], obstacle1_info[:, 0]))
+            
+            obstacle2_distances = torch.norm(obstacle2_info, dim=1, keepdim=True)
+            obstacle2_angles = torch.rad2deg(torch.atan2(obstacle2_info[:, 1], obstacle2_info[:, 0]))
+            
+            # 构建本地观察张量
+            local_obs_batch = torch.cat([
+                evader_distances, evader_angles.unsqueeze(1),
+                obstacle1_distances, obstacle1_angles.unsqueeze(1),
+                obstacle2_distances, obstacle2_angles.unsqueeze(1)
+            ], dim=1)
+            
+            # 处理邻居信息（批量）
+            neighbor1_info = states_batch[:, 8:10]
+            neighbor2_info = states_batch[:, 10:12]
+            
+            neighbor1_distances = torch.norm(neighbor1_info, dim=1, keepdim=True)
+            neighbor1_angles = torch.rad2deg(torch.atan2(neighbor1_info[:, 1], neighbor1_info[:, 0])).unsqueeze(1)
+            
+            neighbor2_distances = torch.norm(neighbor2_info, dim=1, keepdim=True)
+            neighbor2_angles = torch.rad2deg(torch.atan2(neighbor2_info[:, 1], neighbor2_info[:, 0])).unsqueeze(1)
+            
+            # 批量创建嵌入
+            n1_input = torch.cat([neighbor1_distances, neighbor1_angles], dim=1)
+            n2_input = torch.cat([neighbor2_distances, neighbor2_angles], dim=1)
+            if not target:
+                n1_embedding = self.embedding_net(n1_input)
+                n1_key = self.key_net(n1_embedding)
+                
+                n2_embedding = self.embedding_net(n2_input)
+                n2_key = self.key_net(n2_embedding)
+            else:
+                n1_embedding = self.target_embedding_net(n1_input)
+                n1_key = self.target_key_net(n1_embedding)
+                
+                n2_embedding = self.target_embedding_net(n2_input)
+                n2_key = self.target_key_net(n2_embedding)
+            # 计算平均嵌入（批量）
+            mean_embedding = (n1_embedding + n2_embedding) / 2
+            
+            if not target:
+                # 批量计算注意力分数
+                attn1 = self.attention_net(local_obs_batch, mean_embedding, n1_key)
+                attn2 = self.attention_net(local_obs_batch, mean_embedding, n2_key)
+            else:
+                attn1 = self.target_attention_net(local_obs_batch, mean_embedding, n1_key)
+                attn2 = self.target_attention_net(local_obs_batch, mean_embedding, n2_key)
+            
+            # 拼接并应用softmax（批量）
+            attn_cat = torch.cat([attn1, attn2], dim=1)
+            attention_scores = F.softmax(attn_cat, dim=1)
+            
+            # 计算加权嵌入（批量）
+            weighted_embedding = attention_scores[:, 0:1] * n1_embedding + attention_scores[:, 1:2] * n2_embedding
+            
+            # 组合局部观察和加权嵌入（批量）
+            combined_features = torch.cat([local_obs_batch, weighted_embedding], dim=1)
+            
+            return combined_features, attention_scores, local_obs_batch
+        
+        # 主要更新函数逻辑
         states, neighbor_states, actions, rewards, next_states, next_neighbor_states, dones = experiences
-        batch_size = states.size(0)
         
-        q_losses = []
-        kl_losses = []
+        # 批量处理当前状态
+        features, attention_scores, local_obs = process_batch_observation(states, False)
         
-        for i in range(batch_size):
-            state = states[i].unsqueeze(0)
-            next_state = next_states[i].unsqueeze(0)
-            
-            # Extract neighbor states for this batch item
-            state_neighbors = [n_states[i].unsqueeze(0) for n_states in neighbor_states]
-            next_state_neighbors = [n_states[i].unsqueeze(0) for n_states in next_neighbor_states]
-            
-            # Process current state
-            features, attention_scores, local_obs = self.process_observation( state.cpu().numpy().squeeze())
-            
-            # Process next state
-            next_features, _, next_local_obs = self.process_observation(next_state.cpu().numpy().squeeze())
-            
-            # Get target attention scores
-            with torch.no_grad():
-                target_features, target_attention_scores, _ = self.process_observation_target(
-                    state.cpu().numpy().squeeze()
-                )
-            
-            # Get Q-values and state values
-            q_values, _ = self.dueling_net(features)
-            action_idx = torch.argmax(q_values)
-            
-            # Get target Q-values
-            with torch.no_grad():
-                next_q_values, _ = self.target_dueling_net(next_features)
-                next_max_q = torch.max(next_q_values)
-                
-                target_q = rewards[i] + GAMMA * next_max_q * (1 - dones[i])
-            
-            # Calculate TD error
-            q_val = q_values[0, action_idx].unsqueeze(0)  # Ensure tensors have the same shape
-            q_loss = F.mse_loss(q_val, target_q)
-            q_losses.append(q_loss)
-            
-            # Calculate KL divergence if attention scores exist
-            if len(attention_scores) > 0 and len(target_attention_scores) > 0:
-                # Convert numpy arrays to tensors
-                if isinstance(attention_scores, np.ndarray):
-                    attention_scores = torch.tensor(attention_scores).to(device)
-                if isinstance(target_attention_scores, np.ndarray):
-                    target_attention_scores = torch.tensor(target_attention_scores).to(device)
-                
-                # Calculate KL divergence
-                kl_loss = F.kl_div(
-                    F.log_softmax(attention_scores, dim=0),
-                    F.softmax(target_attention_scores, dim=0),
-                    reduction='batchmean'
-                )
-                kl_losses.append(kl_loss)
+        # 批量处理下一状态
+        next_features, _, _ = process_batch_observation(next_states, False)
         
-        # Average losses
-        q_loss = torch.stack(q_losses).mean()
+        # 使用目标网络批量处理
+        with torch.no_grad():
+            target_features, target_attention_scores, _ = process_batch_observation(states, True)
+            target_features = target_features.detach()
+            target_attention_scores = target_attention_scores.detach()
         
-        if kl_losses:
-            kl_loss = torch.stack(kl_losses).mean()
-            total_loss = q_loss + KL_WEIGHT * kl_loss
-        else:
-            kl_loss = torch.tensor(0.0).to(device)
-            total_loss = q_loss
+        # 批量获取Q值
+        q_values, _ = self.dueling_net(features)
+        actions_idx = torch.argmax(q_values, dim=1)
         
-        # Update networks
+        # 批量计算目标Q值
+        with torch.no_grad():
+            next_q_values, _ = self.target_dueling_net(next_features)
+            next_max_q = torch.max(next_q_values, dim=1)[0]
+            target_q = rewards.squeeze() + GAMMA * next_max_q * (1 - dones.squeeze())
+        
+        # 计算TD误差
+        batch_indices = torch.arange(q_values.size(0))
+        q_val = q_values[batch_indices, actions_idx]
+        q_loss = F.mse_loss(q_val, target_q)
+        
+        # 计算KL散度
+        kl_loss = F.kl_div(
+            F.log_softmax(attention_scores, dim=1),
+            F.softmax(target_attention_scores, dim=1),
+            reduction='batchmean'
+        )
+        
+        # 总损失
+        total_loss = q_loss + KL_WEIGHT * kl_loss
+        
+        # 更新网络
         self.optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), CLIP_GRAD)
         self.optimizer.step()
         
-        # Soft update target networks
+        # 软更新目标网络
         self.soft_update_targets()
         
         return total_loss.item(), q_loss.item(), kl_loss.item()
     
-    def process_observation_target(self, obs):
-        evader_dist, evader_angle, obstacle_dist_list, obstacle_angle_list = extract_local_observation(obs)
-        local_obs = np.array([evader_dist, evader_angle, obstacle_dist_list[0], obstacle_angle_list[0], obstacle_dist_list[1], obstacle_angle_list[1]], dtype=np.float32) # o_{loc, i}
-        local_obs_tensor = torch.FloatTensor(local_obs).unsqueeze(0).to(device)
-        
-        # Process neighbor information
-        neighbor_embeddings = []
-        neighbor_keys = []
-        neighbor_info = extract_neighbor_info(obs)
-        
-        # Create embeddings for each neighbor
-        for i, n_info in enumerate(neighbor_info):
-            distance, angle = n_info[0], n_info[1]
-            n_input = torch.FloatTensor([distance, angle]).unsqueeze(0).to(device)
-            
-            # Use target networks
-            n_embedding = self.target_embedding_net(n_input)
-            n_key = self.target_key_net(n_embedding)
-            
-            neighbor_embeddings.append(n_embedding)
-            neighbor_keys.append(n_key)
-        
-        # Calculate mean embedding
-        if neighbor_embeddings:
-            neighbor_embeddings_tensor = torch.cat(neighbor_embeddings, dim=0)
-            mean_embedding = torch.mean(neighbor_embeddings_tensor, dim=0, keepdim=True)
-        else:
-            mean_embedding = torch.zeros(1, EMBEDDING_SIZE).to(device)
-        
-        # Calculate attention scores for each neighbor
-        attention_scores_raw = []
-        for i, n_key in enumerate(neighbor_keys):
-            # Calculate raw attention score using target attention network
-            raw_score = self.target_attention_net(local_obs_tensor, mean_embedding, n_key)
-            attention_scores_raw.append(raw_score)
-        
-        # Apply softmax to get normalized attention scores
-        if attention_scores_raw:
-            attention_scores_tensor = torch.cat(attention_scores_raw, dim=0)
-            attention_scores = F.softmax(attention_scores_tensor, dim=0)
-        else:
-            attention_scores = torch.tensor([]).to(device)
-        
-        # Calculate weighted embedding
-        weighted_embedding = torch.zeros(1, EMBEDDING_SIZE).to(device)
-        for i, (n_emb, score) in enumerate(zip(neighbor_embeddings, attention_scores)):
-            weighted_embedding += score * n_emb
-        
-        # Combine local observation with weighted embedding
-        combined_features = torch.cat([local_obs_tensor, weighted_embedding], dim=1)
-        
-        return combined_features, attention_scores.detach().cpu().numpy(), local_obs_tensor
-        
     def hard_update_targets(self):
         self.target_embedding_net.load_state_dict(self.embedding_net.state_dict())
         self.target_key_net.load_state_dict(self.key_net.state_dict())

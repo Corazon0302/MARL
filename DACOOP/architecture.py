@@ -154,10 +154,10 @@ def extract_local_observation(obs):
     evader_distance = np.linalg.norm(evader_rel_pos)
     evader_angle = np.degrees(np.arctan2(evader_rel_pos[1], evader_rel_pos[0]))
     
-    obstacle1_rel_pos = obs[6:8]
+    obstacle1_rel_pos = obs[4:6]
     obstacle1_distance = np.linalg.norm(obstacle1_rel_pos)
     obstacle1_angle = np.degrees(np.arctan2(obstacle1_rel_pos[1], obstacle1_rel_pos[0]))
-    obstacle2_rel_pos = obs[8:10]
+    obstacle2_rel_pos = obs[6:8]
     obstacle2_distance = np.linalg.norm(obstacle2_rel_pos)
     obstacle2_angle = np.degrees(np.arctan2(obstacle2_rel_pos[1], obstacle2_rel_pos[0]))
     obstacle_distance = np.array([obstacle1_distance, obstacle2_distance])

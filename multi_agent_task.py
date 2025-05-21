@@ -17,7 +17,7 @@ os.environ['SDL_VIDEODRIVER'] = 'x11'  # 使用X11驱动
 os.environ['DISPLAY'] = ':0'          # 确保正确的显示设置
 
 # 设置随机种子
-SEED = 0
+SEED = 47
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)

@@ -33,7 +33,6 @@ class ReplayBuffer:
         self.memory.append(self.experience(state, neighbor_states, action, reward, next_state, next_neighbor_states, done))
         
     def sample(self):
-        """Randomly sample a batch of experiences from memory"""
         experiences = random.sample(self.memory, k=self.batch_size)
         
         states = torch.FloatTensor(np.vstack([e.state for e in experiences if e is not None])).to(device)
@@ -139,6 +138,7 @@ class DACOOPTrainer:
         for agent_id, agent in self.dacoop_agents.items():
             agent.load(path)
 
+import time
 def train_dacoop(env, trainer:DACOOPTrainer, n_episodes=NUM_EPISODES):
     episode_rewards = []
     avg_rewards = []
@@ -146,7 +146,6 @@ def train_dacoop(env, trainer:DACOOPTrainer, n_episodes=NUM_EPISODES):
     
     for episode in range(1, n_episodes+1):
         # observations, _ = env.reset(seed=np.random.randint(1000))
-        print(f"Episode {episode}/{n_episodes}")
         observations, _ = env.reset(seed=SEED)
         episode_reward = 0
         step_count = 0
@@ -158,7 +157,7 @@ def train_dacoop(env, trainer:DACOOPTrainer, n_episodes=NUM_EPISODES):
         while not episode_done and step_count < MAX_STEPS:
             actions = trainer.get_actions(observations, add_noise=(len(trainer.buffer) < START_TRAINING))
             next_observations, rewards, terminations, truncations, _ = env.step(actions)
-            
+
             dones = {agent_id: terminations[agent_id] or truncations[agent_id] for agent_id in env.possible_agents}
             episode_done = any(dones.values())
             
