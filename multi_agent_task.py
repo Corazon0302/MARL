@@ -16,8 +16,6 @@ import os
 os.environ['SDL_VIDEODRIVER'] = 'x11'  # 使用X11驱动
 os.environ['DISPLAY'] = ':0'          # 确保正确的显示设置
 
-# 如果仍有问题，尝试使用下面的设置
-# os.environ['QT_X11_NO_MITSHM'] = '1'
 # 设置随机种子
 SEED = 0
 torch.manual_seed(SEED)
